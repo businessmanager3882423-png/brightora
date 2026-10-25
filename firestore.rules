@@ -1,0 +1,272 @@
+
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function accessExists() {
+      return exists(
+        /databases/$(database)/documents/settings/ownerAccess
+      );
+    }
+
+    function access() {
+      return get(
+        /databases/$(database)/documents/settings/ownerAccess
+      ).data;
+    }
+
+    function isOwner() {
+      return signedIn()
+        && accessExists()
+        && access().ownerUids is list
+        && request.auth.uid in access().ownerUids;
+    }
+
+    function isStaff() {
+      return signedIn()
+        && accessExists()
+        && access().staffUids is list
+        && request.auth.uid in access().staffUids;
+    }
+
+    function hasStaffRole(roles) {
+      return isStaff()
+        && access().staffRoles is map
+        && access().staffRoles[request.auth.uid] in roles;
+    }
+
+    function canManageProjects() {
+      return isOwner()
+        || hasStaffRole(['project_manager', 'staff']);
+    }
+
+    function canManageFinance() {
+      return isOwner()
+        || hasStaffRole(['finance', 'staff']);
+    }
+
+    function canSupport() {
+      return isOwner()
+        || hasStaffRole(['support', 'staff']);
+    }
+
+    function validText(value, min, max) {
+      return value is string
+        && value.size() >= min
+        && value.size() <= max;
+    }
+
+    // Owner access: only owner can change permissions.
+    match /settings/ownerAccess {
+      allow read: if isOwner() || isStaff();
+      allow write: if isOwner();
+    }
+
+    // Public website settings.
+    match /settings/public {
+      allow read: if true;
+      allow create, update, delete: if isOwner();
+    }
+
+    // User profiles.
+    match /users/{uid} {
+      allow read: if signedIn()
+        && (request.auth.uid == uid || isOwner());
+
+      allow create: if signedIn()
+        && request.auth.uid == uid
+        && request.resource.data.uid == uid
+        && request.resource.data.email == request.auth.token.email
+        && !request.resource.data.keys().hasAny([
+          'role', 'isAdmin', 'admin', 'owner'
+        ]);
+
+      allow update: if isOwner()
+        || (
+          signedIn()
+          && request.auth.uid == uid
+          && !request.resource.data.diff(resource.data)
+            .affectedKeys().hasAny([
+              'uid', 'email', 'role', 'isAdmin',
+              'admin', 'owner', 'createdAt'
+            ])
+        );
+
+      allow delete: if isOwner();
+    }
+
+    // Public services; only owner manages them.
+    match /services/{id} {
+      allow read: if resource.data.active == true
+        || isOwner();
+
+      allow create, update, delete: if isOwner();
+    }
+
+    // Published website content.
+    match /siteContent/{id} {
+      allow read: if resource.data.published == true
+        || isOwner();
+
+      allow create, update, delete: if isOwner();
+    }
+
+    // Client projects/orders.
+    match /orders/{id} {
+      allow create: if signedIn()
+        && request.resource.data.clientUid == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && request.resource.data.paymentStatus == 'unpaid'
+        && validText(request.resource.data.title, 3, 120)
+        && validText(request.resource.data.requirements, 20, 5000)
+        && request.resource.data.keys().hasOnly([
+          'clientUid', 'clientName', 'clientEmail', 'service',
+          'title', 'requirements', 'budget', 'deadline',
+          'referenceUrl', 'status', 'currency', 'quoteAmount',
+          'adminNote', 'paymentStatus', 'amountPaid',
+          'progress', 'createdAt', 'updatedAt'
+        ]);
+
+      allow read: if signedIn()
+        && (resource.data.clientUid == request.auth.uid || isOwner());
+
+      allow update: if canManageProjects()
+        || (
+          signedIn()
+          && resource.data.clientUid == request.auth.uid
+          && request.resource.data.diff(resource.data)
+            .affectedKeys().hasOnly(['referenceUrl', 'updatedAt'])
+        );
+
+      allow delete: if isOwner();
+    }
+
+    // Quotes.
+    match /quotes/{id} {
+      allow read: if signedIn()
+        && (resource.data.clientUid == request.auth.uid || isOwner());
+
+      allow create: if canManageProjects()
+        && request.resource.data.createdBy == request.auth.uid
+        && validText(request.resource.data.projectTitle, 1, 160)
+        && request.resource.data.total is number
+        && request.resource.data.total > 0;
+
+      allow update: if canManageFinance()
+        || (
+          signedIn()
+          && resource.data.clientUid == request.auth.uid
+          && resource.data.status == 'sent'
+          && request.resource.data.status in ['accepted', 'declined']
+          && request.resource.data.diff(resource.data)
+            .affectedKeys().hasOnly([
+              'status', 'acceptedAt', 'updatedAt'
+            ])
+        );
+
+      allow delete: if isOwner();
+    }
+
+    // Invoices.
+    match /invoices/{id} {
+      allow read: if signedIn()
+        && (resource.data.clientUid == request.auth.uid || isOwner());
+
+      allow create: if canManageFinance()
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.total is number
+        && request.resource.data.total > 0
+        && request.resource.data.amountPaid == 0;
+
+      allow update: if canManageFinance();
+      allow delete: if isOwner();
+    }
+
+    // Support tickets.
+    match /supportTickets/{id} {
+      allow create: if signedIn()
+        && request.resource.data.clientUid == request.auth.uid
+        && request.resource.data.status == 'open'
+        && validText(request.resource.data.subject, 3, 120)
+        && validText(request.resource.data.message, 10, 3000)
+        && request.resource.data.keys().hasOnly([
+          'clientUid', 'clientEmail', 'subject', 'message',
+          'orderId', 'status', 'adminReply',
+          'createdAt', 'updatedAt'
+        ]);
+
+      allow read: if signedIn()
+        && (resource.data.clientUid == request.auth.uid || isOwner());
+
+      allow update: if canSupport();
+      allow delete: if isOwner();
+    }
+
+    // Booking requests.
+    match /bookings/{id} {
+      allow create: if signedIn()
+        && request.resource.data.clientUid == request.auth.uid
+        && request.resource.data.status == 'requested'
+        && validText(request.resource.data.topic, 3, 150)
+        && validText(request.resource.data.date, 10, 10)
+        && validText(request.resource.data.time, 4, 8);
+
+      allow read: if signedIn()
+        && (resource.data.clientUid == request.auth.uid || isOwner());
+
+      allow update: if canManageProjects();
+      allow delete: if isOwner();
+    }
+
+    // In-app notifications.
+    match /notifications/{id} {
+      allow read: if signedIn()
+        && (resource.data.uid == request.auth.uid || isOwner());
+
+      allow create: if isOwner();
+
+      allow update: if signedIn()
+        && resource.data.uid == request.auth.uid
+        && request.resource.data.diff(resource.data)
+          .affectedKeys().hasOnly(['read']);
+
+      allow delete: if isOwner();
+    }
+
+    // Public contact form.
+    match /inquiries/{id} {
+      allow create: if request.resource.data.name is string
+        && request.resource.data.name.size() >= 2
+        && request.resource.data.email is string
+        && request.resource.data.message is string
+        && request.resource.data.message.size() >= 10
+        && request.resource.data.keys().hasOnly([
+          'name', 'email', 'message', 'status', 'createdAt'
+        ]);
+
+      allow read, update, delete: if isOwner();
+    }
+
+    // Staff management.
+    match /staff/{id} {
+      allow read, create, update, delete: if isOwner();
+    }
+
+    // Activity logs.
+    match /activityLogs/{id} {
+      allow read: if isOwner();
+      allow create: if isOwner() || isStaff();
+      allow update, delete: if false;
+    }
+
+    // Deny everything not explicitly allowed above.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
